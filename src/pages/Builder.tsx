@@ -9,7 +9,7 @@ import type {
   ProjectEntry,
   ResumeData,
 } from '../types/resume';
-import { emptyResumeData, type TemplateKey } from '../types/resume';
+import type { TemplateKey } from '../types/resume';
 import { TEMPLATES, isTemplateKey } from '../templates';
 import { loadResumeData, saveResumeData } from '../lib/storage';
 import { SkipLink } from '../components/SkipLink';
@@ -21,7 +21,8 @@ export function Builder() {
   const [searchParams] = useSearchParams();
   const { showToast } = useToast();
 
-  const [data, setData] = useState<ResumeData>(emptyResumeData);
+  // Lazy init so the first save can never overwrite stored data with the empty default (StrictMode re-runs effects).
+  const [data, setData] = useState<ResumeData>(loadResumeData);
   const [template, setTemplate] = useState<TemplateKey>(() => {
     const t = searchParams.get('template');
     return isTemplateKey(t ?? undefined) ? (t as TemplateKey) : 'modern';
@@ -30,11 +31,6 @@ export function Builder() {
 
   const previewRef = useRef<HTMLDivElement>(null);
 
-  // Load persisted data on mount only.
-  useEffect(() => {
-    setData(loadResumeData());
-  }, []);
-
   // Persist on every change.
   useEffect(() => {
     saveResumeData(data);
@@ -42,6 +38,34 @@ export function Builder() {
 
   function updatePersonal(field: keyof ResumeData['personal'], value: string) {
     setData((d) => ({ ...d, personal: { ...d.personal, [field]: value } }));
+  }
+
+  const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+
+  // Validates, then downscales to a 240px-max JPEG so the data URL stays small enough for localStorage.
+  function handlePhoto(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!/^image\/(jpeg|png|webp)$/.test(file.type)) return showToast('Please choose a JPG, PNG or WebP image.');
+    if (file.size > MAX_PHOTO_BYTES) return showToast('Photo must be under 5 MB.');
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const side = Math.min(img.width, img.height);
+      const size = Math.min(240, side);
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = size;
+      // Centre-crop to a square.
+      canvas.getContext('2d')?.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+      updatePersonal('photo', canvas.toDataURL('image/jpeg', 0.85));
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      showToast('Could not read that image.');
+    };
+    img.src = url;
   }
 
   function updateSummary(value: string) {
@@ -99,14 +123,40 @@ export function Builder() {
     setDownloading(true);
     try {
       const html2pdf = (await import('html2pdf.js')).default;
+      // Capture at real A4 width, with height rounded up to whole pages (minus 1px so rounding
+      // never adds a blank page), so Executive/Minimal backgrounds fill every page.
+      const root = el.firstElementChild as HTMLElement | null; // the template root carries its own background
+      const prev = { width: el.style.width, minHeight: el.style.minHeight, background: el.style.background, rootMin: root?.style.minHeight ?? '' };
+      el.style.width = '210mm';
+      el.style.minHeight = '0';
+      const pagePx = (el.offsetWidth * 297) / 210;
+      const fullHeight = `${Math.max(1, Math.ceil((el.scrollHeight - 1) / pagePx)) * pagePx - 1}px`;
+      el.style.minHeight = fullHeight;
+      if (root) root.style.minHeight = fullHeight;
+      // The wrapper carries the page background so it continues below the template root.
+      if (template === 'executive') el.style.background = '#0d0d0d';
+      if (template === 'minimal') el.style.background = 'linear-gradient(to right, #eef6f5 167px, #0f766e 167px 170px, #fff 170px)';
+      // html2canvas measures text baselines in the live document with an inline <img>; the global
+      // `img { display: block }` breaks that and pushes text down inside boxes (clipped pills/titles).
+      const fix = document.createElement('style');
+      fix.textContent = 'span + img { display: inline !important; }';
+      document.head.appendChild(fix);
       const opt = {
         margin: 0,
-        filename: `${(data.personal.name || 'resume').replace(/\s+/g, '_')}_resume.pdf`,
+        filename: `${(data.personal.name.replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'resume')}_resume.pdf`,
         image: { type: 'jpeg', quality: 0.98 },
         html2canvas: { scale: 2, useCORS: true, letterRendering: true },
         jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
       };
-      await html2pdf().set(opt).from(el).save();
+      try {
+        await html2pdf().set(opt).from(el).save();
+      } finally {
+        fix.remove();
+        el.style.width = prev.width;
+        el.style.minHeight = prev.minHeight;
+        el.style.background = prev.background;
+        if (root) root.style.minHeight = prev.rootMin;
+      }
       showToast('Resume downloaded!');
     } catch {
       showToast('Download failed. Please try again.');
@@ -127,11 +177,11 @@ export function Builder() {
               <Link to="/" className="nav-logo">
                 Works<span>Lab</span>
               </Link>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-                <span style={{ fontSize: '0.82rem', color: 'var(--gray-400)' }}>
+              <div className="builder-nav-actions" style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                <span className="builder-nav-meta" style={{ fontSize: '0.82rem', color: 'var(--gray-400)' }}>
                   Template: <strong style={{ color: 'var(--black)' }}>{TEMPLATES[template].name}</strong>
                 </span>
-                <span style={{ fontSize: '0.75rem', color: 'var(--green)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span className="builder-nav-meta" style={{ fontSize: '0.75rem', color: 'var(--green)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <span aria-hidden="true">●</span> Auto-saved
                 </span>
                 <button
@@ -161,6 +211,18 @@ export function Builder() {
               {/* Personal Info */}
               <div className="form-section">
                 <div className="form-section-title">Personal Information</div>
+                <div className="form-group">
+                  <label className="form-label" htmlFor="photo">Photo (optional)</label>
+                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
+                    {data.personal.photo && (
+                      <img src={data.personal.photo} alt="Your photo" style={{ width: 48, height: 48, borderRadius: '50%', objectFit: 'cover' }} />
+                    )}
+                    <input id="photo" type="file" accept="image/jpeg,image/png,image/webp" onChange={handlePhoto} />
+                    {data.personal.photo && (
+                      <button type="button" className="btn" onClick={() => updatePersonal('photo', '')}>Remove</button>
+                    )}
+                  </div>
+                </div>
                 <div className="form-group">
                   <label className="form-label" htmlFor="name">Full Name</label>
                   <input className="form-input" id="name" placeholder="Rahul Sharma" value={data.personal.name} onChange={(e) => updatePersonal('name', e.target.value)} />
